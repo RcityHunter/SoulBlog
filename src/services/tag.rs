@@ -80,8 +80,8 @@ impl TagService {
                 0 AS follower_count, \
                 0 AS article_count, \
                 is_featured, \
-                IF created_at = NONE { time::now() } ELSE { created_at } END AS created_at, \
-                IF updated_at = NONE { time::now() } ELSE { updated_at } END AS updated_at \
+                IF created_at = NONE THEN time::now() ELSE created_at END AS created_at, \
+                IF updated_at = NONE THEN time::now() ELSE updated_at END AS updated_at \
              FROM tag"
         );
         let mut conditions: Vec<String> = Vec::new();
@@ -144,8 +144,8 @@ impl TagService {
                 0 AS follower_count,
                 0 AS article_count,
                 is_featured,
-                IF created_at = NONE { time::now() } ELSE { created_at } END AS created_at,
-                IF updated_at = NONE { time::now() } ELSE { updated_at } END AS updated_at
+                IF created_at = NONE THEN time::now() ELSE created_at END AS created_at,
+                IF updated_at = NONE THEN time::now() ELSE updated_at END AS updated_at
             FROM tag WHERE slug = $slug LIMIT 1
         "#;
         let mut response = self.db.query_with_params(sql, json!({"slug": slug})).await?;
