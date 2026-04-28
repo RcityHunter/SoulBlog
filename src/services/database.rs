@@ -232,7 +232,6 @@ impl Database {
 
     /// 验证数据库连接
     pub async fn verify_connection(&self) -> Result<()> {
-        // 尝试执行一个简单的查询来验证连接
         match self.storage.query("INFO FOR DB").await {
             Ok(_) => {
                 info!("Database connection verified successfully");
@@ -243,6 +242,38 @@ impl Database {
                 Err(AppError::from(e))
             }
         }
+    }
+
+    /// 初始化所有表 schema（SurrealDB 3.0 要求表必须先定义才能 SELECT）
+    pub async fn initialize_schema(&self) -> Result<()> {
+        let tables = [
+            "user_auth", "user_profile", "article", "tag", "article_tag",
+            "comment", "clap", "follow", "bookmark", "notification",
+            "publication", "publication_member", "series", "series_article",
+            "subscription", "payment", "revenue", "media", "domain",
+            "recommendation", "analytics_event", "search_index",
+            "user_tag_follow", "article_view", "article_share",
+            "publication_revenue", "stripe_customer", "stripe_account",
+            "ai_config",
+        ];
+        let mut sql = String::new();
+        for table in &tables {
+            sql.push_str(&format!("DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;\n", table));
+        }
+        // Ensure datetime defaults for key tables (OVERWRITE to update if already defined)
+        for table in &["article", "user_profile", "comment", "tag"] {
+            sql.push_str(&format!(
+                "DEFINE FIELD OVERWRITE created_at ON TABLE {} DEFAULT time::now();\n",
+                table
+            ));
+            sql.push_str(&format!(
+                "DEFINE FIELD OVERWRITE updated_at ON TABLE {} DEFAULT time::now();\n",
+                table
+            ));
+        }
+        self.storage.query(&sql).await.map_err(AppError::from)?;
+        info!("Schema initialized: {} tables + datetime defaults defined", tables.len());
+        Ok(())
     }
 
     /// 使用查询构建器创建查询
@@ -396,12 +427,6 @@ impl Database {
         Ok(records.into_iter().next())
     }
 
-    /// 开始事务
-    pub async fn begin_transaction(&self) -> Result<Transaction> {
-        self.storage.begin_transaction()
-            .await
-            .map_err(|e| AppError::from(e))
-    }
 }
 
 /// 分页结果结构

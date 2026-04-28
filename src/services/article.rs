@@ -54,7 +54,10 @@ fn normalize_surreal_id(id: &str) -> String {
         return res;
     }
 
-    let cleaned = trimmed.replace('⟨', "").replace('⟩', "");
+    // Strip SurrealDB escaping characters (angle brackets and backticks)
+    let cleaned = trimmed
+        .replace('⟨', "").replace('⟩', "")
+        .replace('`', "");
     if let Some(res) = try_from_json_str(&cleaned) {
         return res;
     }
@@ -314,7 +317,16 @@ impl ArticleService {
             publication_id: request.publication_id,
             series_id: request.series_id,
             series_order: request.series_order,
-            status: if request.save_as_draft.unwrap_or(true) { ArticleStatus::Draft } else { ArticleStatus::Published },
+            status: {
+                // Explicit `status` field takes precedence over `save_as_draft` flag
+                if let Some(s) = request.status.clone() {
+                    s
+                } else if request.save_as_draft.unwrap_or(true) {
+                    ArticleStatus::Draft
+                } else {
+                    ArticleStatus::Published
+                }
+            },
             is_paid_content: request.is_paid_content.unwrap_or(false),
             is_featured: false,
             reading_time: 0, // 稍后计算
@@ -409,10 +421,8 @@ impl ArticleService {
             params_map.insert("seo_description".into(), json!(seo_description));
         }
         params_map.insert("seo_keywords".into(), json!(article.seo_keywords));
-        // NOTE:
-        // `created_at/updated_at/published_at` are datetime fields in schema.
-        // Do not send chrono timestamps as JSON strings in CONTENT payload.
-        // Let DB defaults fill created/updated, and set published_at via DB time::now().
+        // created_at and updated_at are filled by DEFINE FIELD DEFAULT time::now()
+        // published_at is set via UPDATE after CREATE if status == Published
         params_map.insert("is_deleted".into(), json!(false));
         if let Some(obj) = article.metadata.as_object() {
             if !obj.is_empty() {
@@ -747,9 +757,9 @@ impl ArticleService {
             conditions.push(format!("author_id = $author"));
         }
 
-        // 标签过滤
-        if let Some(tag) = &query.tag {
-            conditions.push(format!("$tag IN tags"));
+        // 标签过滤：通过 article_tag 联表查询
+        if let Some(_tag) = &query.tag {
+            conditions.push("id IN (SELECT VALUE article_id FROM article_tag WHERE tag_id.slug = $tag)".to_string());
         }
 
         // 出版物过滤
@@ -1006,79 +1016,55 @@ impl ArticleService {
     /// 获取或创建标签
     async fn get_or_create_tag(&self, tag_name: &str) -> Result<String> {
         let slug = slug::generate_slug(tag_name);
-        debug!("Getting or creating tag with name: {}, slug: {}", tag_name, slug);
-        
-        // 查找现有标签
-        if let Some(tag) = self.db.find_one::<JsonValue>("tag", "slug", &slug).await? {
-            debug!("Found existing tag: {:?}", tag);
-            if let Some(id_value) = tag.get("id") {
-                match id_value {
-                    JsonValue::String(s) => return Ok(s.clone()),
-                    JsonValue::Object(obj) => {
-                        // 处理 Thing 格式 { "tb": "tag", "id": { "String": "xxx" } }
-                        if let (Some(tb), Some(id)) = (obj.get("tb"), obj.get("id")) {
-                            let tb_str = tb.as_str().unwrap_or("tag");
-                            let id_str = match id {
-                                JsonValue::String(s) => s.clone(),
-                                JsonValue::Object(id_obj) => {
-                                    id_obj.get("String")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("unknown")
-                                        .to_string()
-                                },
-                                _ => id.to_string()
-                            };
-                            return Ok(format!("{}:{}", tb_str, id_str));
-                        }
-                    },
-                    _ => {}
+        debug!("Getting or creating tag: {} (slug={})", tag_name, slug);
+
+        // Check if tag exists using VALUE query which returns bare values
+        let check = self.db.query_with_params(
+            "SELECT VALUE type::string(id) FROM tag WHERE slug = $slug LIMIT 1",
+            json!({ "slug": &slug }),
+        ).await;
+
+        if let Ok(mut r) = check {
+            let ids: Vec<JsonValue> = r.take(0).unwrap_or_default();
+            if let Some(id_val) = ids.into_iter().next() {
+                let id_str = match &id_val {
+                    JsonValue::String(s) => s.clone(),
+                    other => other.to_string().trim_matches('"').to_string(),
+                };
+                if !id_str.is_empty() && id_str != "null" {
+                    debug!("Found existing tag: {}", id_str);
+                    return Ok(id_str);
                 }
             }
         }
 
-        // 创建新标签
+        // Create new tag
         let tag_uuid = Uuid::new_v4().to_string();
-        let tag_id = format!("tag:{}", tag_uuid);
-        debug!("Creating new tag with id: {}", tag_id);
-        
-        // 使用 CREATE tag:id 语法而不是参数化的 $id
-        let query = format!(
-            r#"
-            CREATE tag:`{}` CONTENT {{
-                name: $name,
-                slug: $slug,
-                follower_count: 0,
-                article_count: 0,
-                is_featured: false,
-                created_at: time::now(),
-                updated_at: time::now()
-            }} RETURN *
-            "#,
-            tag_uuid
+        let create_query = format!(
+            "CREATE tag:`{uuid}` CONTENT {{ name: $name, slug: $slug, follower_count: 0, article_count: 0, is_featured: false, created_at: time::now(), updated_at: time::now() }} RETURN VALUE type::string(id)",
+            uuid = tag_uuid
         );
 
-        let result = self.db.query_with_params(
-            &query,
-            json!({ 
-                "name": tag_name,
-                "slug": slug
-            })
-        ).await?;
-
-        let mut response = result;
-        match response.take::<Option<JsonValue>>(0) {
-            Ok(Some(created)) => {
-                debug!("Tag created successfully: {:?}", created);
-                // 我们已经使用了完整的 tag:uuid 格式作为 ID
-                return Ok(tag_id);
-            },
-            Ok(None) => {
-                error!("Tag creation returned no results");
-                Err(AppError::Internal("Tag creation returned no results".to_string()))
-            },
+        match self.db.query_with_params(&create_query, json!({ "name": tag_name, "slug": &slug })).await {
+            Ok(mut result) => {
+                let ids: Vec<JsonValue> = result.take(0).unwrap_or_default();
+                let id_str = ids.into_iter().next()
+                    .and_then(|v| match v { JsonValue::String(s) => Some(s), _ => None })
+                    .unwrap_or_else(|| format!("tag:{}", tag_uuid));
+                debug!("Created tag: {}", id_str);
+                Ok(id_str)
+            }
             Err(e) => {
-                error!("Failed to parse tag creation result: {:?}", e);
-                Err(AppError::Internal(format!("Failed to parse tag creation result: {:?}", e)))
+                // Race condition: another request just created it — fetch and return
+                warn!("Tag create race for slug='{}': {}, fetching existing", slug, e);
+                let mut r2 = self.db.query_with_params(
+                    "SELECT VALUE type::string(id) FROM tag WHERE slug = $slug LIMIT 1",
+                    json!({ "slug": &slug }),
+                ).await?;
+                let ids: Vec<JsonValue> = r2.take(0).unwrap_or_default();
+                ids.into_iter().next()
+                    .and_then(|v| match v { JsonValue::String(s) if !s.is_empty() => Some(s), _ => None })
+                    .ok_or_else(|| AppError::Internal(format!("Failed to get or create tag '{}'", tag_name)))
             }
         }
     }
@@ -1304,44 +1290,36 @@ impl ArticleService {
     async fn get_article_tags(&self, article_id: &str) -> Result<Vec<TagInfo>> {
         debug!("Getting tags for article: {}", article_id);
 
-        // First get article_tag relationships
+        // Dereference tag_id directly — returns tag fields inline
+        let normalized = normalize_surreal_id(article_id);
         let query = r#"
-            SELECT tag_id FROM article_tag WHERE article_id = $article_id
+            SELECT tag_id.id AS id, tag_id.name AS name, tag_id.slug AS slug
+            FROM article_tag
+            WHERE article_id = type::record("article", $aid)
         "#;
 
         let mut response = self.db.query_with_params(query, json!({
-            "article_id": article_id
+            "aid": normalized
         })).await?;
 
-        let tag_relations: Vec<JsonValue> = response.take(0).unwrap_or_default();
-        
-        if tag_relations.is_empty() {
-            return Ok(Vec::new());
-        }
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)?;
+        let list_json = normalize_surreal_json(raw_json);
+        let rows = match list_json {
+            JsonValue::Array(arr) => arr,
+            other if other.is_null() => vec![],
+            other => vec![other],
+        };
 
-        // Extract tag IDs
-        let tag_ids: Vec<String> = tag_relations.iter()
-            .filter_map(|v| v.get("tag_id").and_then(|id| id.as_str()))
-            .map(|s| s.to_string())
-            .collect();
-
-        if tag_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Now get the tags
         let mut tags = Vec::new();
-        for tag_id in tag_ids {
-            let tag_query = "SELECT * FROM $tag_id";
-            if let Ok(mut tag_response) = self.db.query_with_params(tag_query, json!({
-                "tag_id": tag_id
-            })).await {
-                if let Ok(tag_values) = tag_response.take::<Vec<JsonValue>>(0) {
-                    for tag_value in tag_values {
-                        if let Ok(tag_info) = serde_json::from_value::<TagInfo>(tag_value) {
-                            tags.push(tag_info);
-                        }
-                    }
+        for row in rows {
+            let row = normalize_surreal_json(row);
+            if let JsonValue::Object(map) = &row {
+                let id = map.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = map.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let slug = map.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    tags.push(TagInfo { id, name, slug });
                 }
             }
         }
@@ -1987,50 +1965,31 @@ impl ArticleService {
             None
         };
         
-        // Get tags info - 先获取article_tag关系，再获取tag详情
-        let tag_relations_query = "SELECT tag_id FROM article_tag WHERE article_id = $article_id";
-        
-        let mut tag_rel_response = self.db.query_with_params(tag_relations_query, json!({
-            "article_id": &article.id
-        })).await?;
-
-        let tag_rel_raw: Vec<SurrealValue> = tag_rel_response.take(0)?;
-        let tag_relations: Vec<JsonValue> = tag_rel_raw
-            .into_iter()
-            .filter_map(surreal_to_json)
-            .collect();
+        // Get tags via record dereference
+        let normalized_aid = normalize_surreal_id(&article.id);
+        let tag_query = r#"
+            SELECT tag_id.id AS id, tag_id.name AS name, tag_id.slug AS slug
+            FROM article_tag
+            WHERE article_id = type::record("article", $aid)
+        "#;
         let mut tags: Vec<TagInfo> = Vec::new();
-        
-        for rel in tag_relations {
-            let tag_id_opt: Option<String> = match &rel {
-                JsonValue::Object(map) => map
-                    .get("tag_id")
-                    .and_then(JsonValue::as_str)
-                    .map(ToString::to_string),
-                _ => None,
-            };
-            if let Some(tag_id) = tag_id_opt {
-                // 获取tag详情
-                if let Ok(mut tag_response) = self.db.query(&format!("SELECT * FROM {}", tag_id)).await {
-                    if let Ok(tag_raw) = tag_response.take::<Vec<SurrealValue>>(0) {
-                        let tag_values: Vec<JsonValue> = tag_raw
-                            .into_iter()
-                            .filter_map(surreal_to_json)
-                            .collect();
-                        if let Some(tag_value) = tag_values.first() {
-                            let (id, name, slug) = match tag_value {
-                                JsonValue::Object(map) => (
-                                    map.get("id").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                                    map.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                                    map.get("slug").and_then(JsonValue::as_str).unwrap_or("").to_string(),
-                                ),
-                                _ => ("".to_string(), "".to_string(), "".to_string()),
-                            };
-                            tags.push(TagInfo {
-                                id,
-                                name,
-                                slug,
-                            });
+        if let Ok(mut tag_resp) = self.db.query_with_params(tag_query, json!({ "aid": normalized_aid })).await {
+            if let Ok(raw) = tag_resp.take::<SurrealValue>(0) {
+                let raw_json = serde_json::to_value(raw).unwrap_or(JsonValue::Null);
+                let list_json = normalize_surreal_json(raw_json);
+                let rows = match list_json {
+                    JsonValue::Array(arr) => arr,
+                    other if other.is_null() => vec![],
+                    other => vec![other],
+                };
+                for row in rows {
+                    let row = normalize_surreal_json(row);
+                    if let JsonValue::Object(map) = &row {
+                        let id = map.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let name = map.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let slug = map.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !name.is_empty() {
+                            tags.push(TagInfo { id, name, slug });
                         }
                     }
                 }

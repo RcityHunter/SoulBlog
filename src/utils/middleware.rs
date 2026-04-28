@@ -1,4 +1,5 @@
-use crate::{error::AppError, services::AuthService, state::AppState};
+use crate::{error::AppError, services::AuthService, services::auth::User, state::AppState};
+use chrono::{Utc, TimeZone};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, Request},
@@ -51,33 +52,43 @@ pub async fn auth_middleware(
                     .await
                 {
                     Ok(user) => {
-                        debug!("Authenticated user: {} ({})", user.id, user.email);
-
-                        // 确保用户的 profile 存在
-                        let profile_result = app_state
-                            .user_service
-                            .get_or_create_profile(
-                                &user.id,
-                                &user.email,
-                                user.is_verified,
-                                user.username.clone(),
-                                user.display_name.clone(),
-                            )
-                            .await;
-
-                        if let Err(e) = profile_result {
-                            warn!("Failed to ensure user profile exists for user {}: {}", user.id, e);
-                        } else {
-                            debug!("Successfully ensured user profile exists for user {}", user.id);
-                        }
-
-                        // 将用户信息添加到请求中
-                        info!("Inserting user into request extensions: {}", user.id);
+                        debug!("Authenticated user via Rainbow-Auth: {} ({})", user.id, user.email);
+                        let _ = app_state.user_service.get_or_create_profile(
+                            &user.id, &user.email, user.is_verified,
+                            user.username.clone(), user.display_name.clone(),
+                        ).await;
                         request.extensions_mut().insert(user);
                     }
                     Err(e) => {
-                        warn!("Failed to get user from Rainbow-Auth: {}", e);
-                        // 不返回错误，让请求继续处理（作为未认证请求）
+                        // Rainbow-Auth not available — build User from JWT claims (native auth)
+                        debug!("Rainbow-Auth unavailable ({}), falling back to JWT claims for user {}", e, claims.sub);
+                        let email = claims.email.clone().unwrap_or_default();
+                        let profile = app_state.user_service.get_or_create_profile(
+                            &claims.sub, &email, false, None, None,
+                        ).await.ok();
+                        let (username, display_name, avatar_url) = match &profile {
+                            Some(p) => (Some(p.username.clone()), Some(p.display_name.clone()), p.avatar_url.clone()),
+                            None => (None, None, None),
+                        };
+                        let created_at = Utc.timestamp_opt(claims.iat, 0).single().unwrap_or_else(Utc::now);
+                        let user = User {
+                            id: claims.sub.clone(),
+                            email: email.clone(),
+                            username,
+                            display_name,
+                            avatar_url,
+                            roles: vec!["user".to_string()],
+                            permissions: vec![
+                                "article.read".to_string(), "article.write".to_string(),
+                                "article.create".to_string(), "comment.read".to_string(),
+                                "comment.create".to_string(), "user.read_profile".to_string(),
+                                "user.update_profile".to_string(),
+                            ],
+                            is_verified: true,  // native-auth users are verified by registration
+                            created_at,
+                        };
+                        info!("Native auth user resolved: {} ({})", user.id, user.email);
+                        request.extensions_mut().insert(user);
                     }
                 }
             }

@@ -20,3 +20,5 @@ pub mod websocket;
 pub mod domain;
 pub mod publication_content;
 pub mod diagnostics;
+pub mod notifications;
+pub mod ai;

@@ -102,6 +102,7 @@ pub struct CreateArticleRequest {
     
     pub seo_keywords: Option<Vec<String>>,
     pub save_as_draft: Option<bool>,
+    pub status: Option<ArticleStatus>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Validate)]

@@ -81,6 +81,9 @@ async fn main() -> anyhow::Result<()> {
             match db.verify_connection().await {
                 Ok(_) => {
                     info!("Database connection established successfully");
+                    if let Err(e) = db.initialize_schema().await {
+                        warn!("Schema initialization warning: {}", e);
+                    }
                     db
                 }
                 Err(e) => {
@@ -96,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
                     // 重新尝试连接
                     let db = Database::new(&config).await?;
                     db.verify_connection().await?;
+                    if let Err(e) = db.initialize_schema().await {
+                        warn!("Schema initialization warning: {}", e);
+                    }
                     info!("Database auto-started and connected successfully");
                     db
                 }
@@ -212,6 +218,8 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api/blog/ws", routes::websocket::router())
         .nest("/api/blog/domains", routes::domain::router())
         .nest("/api/blog/diagnostics", routes::diagnostics::router())
+        .nest("/api/blog/notifications", routes::notifications::router())
+        .nest("/api/blog/ai", routes::ai::router())
         
         // Health check endpoints (no domain context needed)
         .route("/health", get(health_check))

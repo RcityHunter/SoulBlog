@@ -7,20 +7,184 @@ use crate::{
 use axum::{
     extract::State,
     response::Json,
-    routing::get,
+    routing::{get, post},
     Router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{info, debug, warn};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{SaltString, rand_core::OsRng};
+use jsonwebtoken::{encode, EncodingKey, Header};
+use crate::services::auth::Claims;
+use chrono::{Utc, Duration};
+use uuid::Uuid;
+
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+    pub username: String,
+    pub display_name: Option<String>,
+}
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        // 认证相关的信息路由
+        .route("/login", post(login))
+        .route("/register", post(register))
+        .route("/logout", post(logout))
         .route("/me", get(get_current_user))
         .route("/status", get(get_auth_status))
-        .route("/refresh", get(get_auth_info)) // 获取当前认证信息
+        .route("/refresh", get(get_auth_info))
         .route("/email-status", get(get_email_verification_status))
+}
+
+fn create_jwt(user_id: &str, email: &str, jwt_secret: &str) -> Result<String> {
+    let now = Utc::now();
+    let exp = (now + Duration::days(7)).timestamp();
+    let claims = Claims {
+        sub: user_id.to_string(),
+        exp,
+        iat: now.timestamp(),
+        session_id: Some(Uuid::new_v4().to_string()),
+        email: Some(email.to_string()),
+    };
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(jwt_secret.as_ref()),
+    )
+    .map_err(|e| AppError::Internal(format!("Failed to create JWT: {}", e)))
+}
+
+pub async fn register(
+    State(app_state): State<Arc<AppState>>,
+    Json(req): Json<RegisterRequest>,
+) -> Result<Json<Value>> {
+    // Hash password
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default();
+    let password_hash = argon2
+        .hash_password(req.password.as_bytes(), &salt)
+        .map_err(|e| AppError::Internal(format!("Failed to hash password: {}", e)))?
+        .to_string();
+
+    let user_id = Uuid::new_v4().to_string();
+    let display_name = req.display_name.clone().unwrap_or_else(|| req.username.clone());
+
+    // Check if username or email already taken
+    let existing = app_state.db.query_with_params(
+        "SELECT id FROM user_profile WHERE username = $username OR user_id IN (SELECT id FROM user_auth WHERE email = $email)",
+        serde_json::json!({ "username": req.username, "email": req.email }),
+    ).await;
+
+    // Create user_auth record with credentials (user_id as explicit field)
+    app_state.db.query_with_params(
+        "CREATE user_auth SET user_id = $uid, email = $email, password_hash = $hash, created_at = time::now()",
+        serde_json::json!({
+            "uid": user_id,
+            "email": req.email,
+            "hash": password_hash,
+        }),
+    ).await.map_err(|e| AppError::Database(surrealdb::Error::thrown(e.to_string())))?;
+
+    // Create user profile
+    app_state.user_service.get_or_create_profile(
+        &user_id,
+        &req.email,
+        false,
+        Some(req.username.clone()),
+        Some(display_name.clone()),
+    ).await.map_err(|e| {
+        warn!("Profile creation failed: {}", e);
+        AppError::Internal("Failed to create user profile".to_string())
+    })?;
+
+    let token = create_jwt(&user_id, &req.email, &app_state.config.jwt_secret)?;
+
+    info!("User registered: {} ({})", req.username, req.email);
+
+    Ok(Json(json!({
+        "success": true,
+        "token": token,
+        "user": {
+            "id": user_id,
+            "email": req.email,
+            "username": req.username,
+            "display_name": display_name,
+            "is_verified": false,
+        }
+    })))
+}
+
+pub async fn login(
+    State(app_state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<Value>> {
+    // Look up user_auth by email
+    let mut resp = app_state.db.query_with_params(
+        "SELECT user_id, email, password_hash FROM user_auth WHERE email = $email LIMIT 1",
+        serde_json::json!({ "email": req.email }),
+    ).await.map_err(|e| AppError::Database(surrealdb::Error::thrown(e.to_string())))?;
+
+    let records: Vec<Value> = resp.take(0).map_err(|e| AppError::Internal(e.to_string()))?;
+    let record = records.into_iter().next()
+        .ok_or_else(|| AppError::Authentication("Invalid email or password".to_string()))?;
+
+    let stored_hash = record.get("password_hash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::Internal("Invalid credential record".to_string()))?;
+
+    let user_id = record.get("user_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Verify password
+    let parsed_hash = PasswordHash::new(stored_hash)
+        .map_err(|e| AppError::Internal(format!("Invalid stored hash: {}", e)))?;
+    Argon2::default()
+        .verify_password(req.password.as_bytes(), &parsed_hash)
+        .map_err(|_| AppError::Authentication("Invalid email or password".to_string()))?;
+
+    // Load profile
+    let profile = app_state.user_service.get_or_create_profile(
+        &user_id, &req.email, false, None, None,
+    ).await;
+
+    let (username, display_name) = match &profile {
+        Ok(p) => (p.username.clone(), p.display_name.clone()),
+        Err(_) => (req.email.split('@').next().unwrap_or("user").to_string(), req.email.clone()),
+    };
+
+    let token = create_jwt(&user_id, &req.email, &app_state.config.jwt_secret)?;
+
+    info!("User logged in: {} ({})", username, req.email);
+
+    Ok(Json(json!({
+        "success": true,
+        "token": token,
+        "user": {
+            "id": user_id,
+            "email": req.email,
+            "username": username,
+            "display_name": display_name,
+            "is_verified": false,
+        }
+    })))
+}
+
+pub async fn logout(
+    OptionalAuth(_user): OptionalAuth,
+) -> Result<Json<Value>> {
+    Ok(Json(json!({ "success": true, "message": "Logged out" })))
 }
 
 /// 获取当前用户信息
