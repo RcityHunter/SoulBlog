@@ -18,11 +18,11 @@ tower = { version = "0.4", features = ["util", "timeout", "load-shed", "limit", 
 tokio = { version = "1.28", features = ["full"] }
 
 # 数据库 (迁移到 SurrealDB 3.0)
-surrealdb = { version = "3.0.0", features = ["protocol-http"] }
+surrealdb = { version = "3.0.0", features = ["protocol-http", "protocol-ws"] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
 
 # 使用soulcore进行数据库操作
-soulcore = { path = "../soulcore", default-features = false, features = ["storage", "surrealdb-http"] }
+soulcore = { git = "https://github.com/3W1shes/soulcore.git", branch = "main", default-features = false, features = ["storage", "surrealdb-http"] }
 
 # HTTP客户端
 reqwest = { version = "0.11", features = ["json", "multipart"] }

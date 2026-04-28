@@ -34,11 +34,12 @@ pub fn generate_slug(title: &str) -> String {
         }
     }
     
-    // 如果 slug 为空，使用默认值
+    // Use a short UUID suffix instead of "untitled" to avoid collisions
     if slug.is_empty() {
-        slug = "untitled".to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        slug = format!("post-{}", &id[..8]);
     }
-    
+
     slug
 }
 

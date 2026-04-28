@@ -417,22 +417,23 @@ where
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self> {
-        // 从请求头中提取 Authorization
+        // If auth_middleware already resolved and inserted the user, use it directly
+        if let Some(user) = parts.extensions.get::<User>().cloned() {
+            return Ok(user);
+        }
+
+        // Fallback: extract from Authorization header (for routes not behind auth_middleware)
         let TypedHeader(Authorization(bearer)) = parts
             .extract::<TypedHeader<Authorization<Bearer>>>()
             .await
             .map_err(|_| AppError::Authentication("Missing authorization header".to_string()))?;
 
-        // 从应用状态中获取认证服务
         let Extension(auth_service): Extension<Arc<AuthService>> = parts
             .extract::<Extension<Arc<AuthService>>>()
             .await
             .map_err(|_| AppError::Internal("Auth service not found in request extensions".to_string()))?;
 
-        // 验证 JWT token
         let claims = auth_service.verify_jwt(bearer.token())?;
-
-        // 从 Rainbow-Auth 获取用户详细信息
         auth_service.get_user_from_rainbow_auth(&claims.sub, bearer.token()).await
     }
 }
